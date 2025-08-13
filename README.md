@@ -36,24 +36,25 @@ The structure of `dataset.json` should be as follows:
     ]
 }
 ```
-Training
+### Training
+
 To train the SFDDNet model, run the following command:
 
-Bash
-
+```Bash
 python train.py --root_path "/path/to/your/data/directory" --dataset "SFDDNet_BUSI_Experiment" --num_classes 2
+```
 --root_path: The root directory where your image and mask folders (e.g., DATA, MASK) are located. The paths in dataset.json are relative to this root path.
 
 --dataset: A name for your experiment, which will be used for saving logs and model checkpoints.
 
 --num_classes: The number of output channels for the network. For binary segmentation (lesion vs. background), this should be 2.
 
-Testing / Inference
+### Testing / Inference
 To evaluate a trained model on the test set, use the following command. Make sure you have the trained model weights saved in the appropriate directory from the training process.
 
-Bash
-
+```Bash
 python test.py --root_path "/path/to/your/data/directory" --dataset "SFDDNet_BUSI_Experiment"
+```
 
-Acknowledgements
+# Acknowledgements
 This project is developed based on the excellent CSwin-UNet repository. We express our sincere gratitude to the original authors for making their code publicly available, which has provided a valuable foundation for our research. The original repository can be found at: https://github.com/eatbeanss/CSWin-UNet.
