@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +6,7 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from einops.layers.torch import Rearrange
 import torch.utils.checkpoint as checkpoint
 import numpy as np
+from pytorch_wavelets import DWTForward  # Assuming you have this package for wavelet transform
 
 
 class Mlp(nn.Module):
@@ -319,6 +319,196 @@ class CARAFE4(nn.Module):
         return x
 
 
+class up_conv(nn.Module):
+    def __init__(self, ch_in, ch_out):
+        super(up_conv, self).__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(ch_in, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.up(x)
+        return x
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiScaleFeatureFusion(nn.Module):
+    def __init__(self, channels):
+        super(MultiScaleFeatureFusion, self).__init__()
+        self.conv1x1 = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+        self.conv3x3 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv5x5 = nn.Conv2d(channels, channels, kernel_size=5, padding=2)
+        self.fusion_conv = nn.Conv2d(channels * 3, channels, kernel_size=1)
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 8, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 8, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x1, x2):
+        out1 = self.conv1x1(x1)
+        out2 = self.conv3x3(x1)
+        out3 = self.conv5x5(x1)
+
+        out = torch.cat([out1, out2, out3], dim=1)
+        out = self.fusion_conv(out)
+
+        weight = self.attention(out)
+        out = out * weight + x2 * (1 - weight)
+        return out
+    
+
+class EnhancedFreqAwareBlock(nn.Module):
+    def __init__(self, in_channels, num_heads=8, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_heads = num_heads
+
+        self.low_attn = nn.MultiheadAttention(
+            embed_dim=in_channels,  
+            num_heads=num_heads,
+            dropout=attn_drop
+        )
+        self.low_norm = nn.LayerNorm(in_channels)  
+        self.low_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1)  
+        self.low_proj_drop = nn.Dropout(proj_drop)
+
+        self.high_conv = nn.Sequential(
+            nn.Conv2d(in_channels * 3, in_channels * 3, kernel_size=3, padding=1, groups=in_channels * 3),  # 深度可分离卷积
+            nn.BatchNorm2d(in_channels * 3),
+            nn.ReLU(),
+            nn.Conv2d(in_channels * 3, in_channels * 3, kernel_size=1)  
+        )
+        self.high_gate = nn.Sequential(
+            nn.Conv2d(in_channels * 3, in_channels * 3, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        self.fusion = nn.Conv2d(in_channels * 4, in_channels, kernel_size=1)
+
+    def forward(self, low_freq, high_freq):
+        B, C, H, W = low_freq.shape 
+        low_freq_flat = low_freq.flatten(2).permute(2, 0, 1)  
+        low_attn, _ = self.low_attn(
+            query=low_freq_flat,
+            key=low_freq_flat,
+            value=low_freq_flat
+        )  
+        low_attn = self.low_norm(low_attn)  
+        low_attn = low_attn.permute(1, 2, 0).view(B, C, H, W)  
+        low_feat = self.low_proj(low_attn)  
+        low_feat = self.low_proj_drop(low_feat)
+
+        high_feat = self.high_conv(high_freq)  
+        high_gate = self.high_gate(high_freq)  
+        high_enhanced = high_feat * high_gate  
+
+        fused = torch.cat([low_feat, high_enhanced], dim=1)  
+        fused = self.fusion(fused)  
+
+        return fused
+
+
+class TokenChannelSelector(nn.Module):
+    def __init__(self, embed_dim, keep_ratio=0.7, channel_keep_ratio=0.7):
+        super(TokenChannelSelector, self).__init__()
+        self.keep_ratio = keep_ratio
+        self.channel_keep_ratio = channel_keep_ratio
+        self.token_score_layer = nn.Linear(embed_dim, 1)
+        self.channel_score_layer = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(embed_dim, embed_dim // 16, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(embed_dim // 16, embed_dim, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (B, N, C)
+        B, N, C = x.size()
+
+        # ===== Token mask =====
+        token_scores = self.token_score_layer(x).squeeze(-1)  # (B, N)
+        k = int(self.keep_ratio * N)
+        _, topk_token_indices = token_scores.topk(k, dim=1)
+        token_mask = torch.zeros_like(token_scores)  # (B, N)
+        token_mask.scatter_(1, topk_token_indices, 1)
+        token_mask = token_mask.unsqueeze(-1)  # (B, N, 1)
+
+        # ===== Channel mask =====
+        x_permuted = x.permute(0, 2, 1)  # (B, C, N)
+        channel_weights = self.channel_score_layer(x_permuted).squeeze(-1)  # (B, C)
+        c = int(self.channel_keep_ratio * C)
+        _, topk_channel_indices = channel_weights.topk(c, dim=1)
+        channel_mask = torch.zeros_like(channel_weights)  # (B, C)
+        channel_mask.scatter_(1, topk_channel_indices, 1)
+        channel_mask = channel_mask.unsqueeze(2)  # (B, C, 1)
+
+        x_masked = x * token_mask  # (B, N, C)
+        x_masked = x_masked.permute(0, 2, 1) * channel_mask  # (B, C, N)
+        output = x_masked.permute(0, 2, 1)  # (B, N, C)
+
+        return output
+
+
+class CSWinBlockWithSelector(nn.Module):
+
+    def __init__(self, dim, reso, num_heads,
+                 split_size, mlp_ratio=4., qkv_bias=False, qk_scale=None,
+                 drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 last_stage=False):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.patches_resolution = reso
+        self.split_size = split_size
+        self.mlp_ratio = mlp_ratio
+        self.norm1 = norm_layer(dim)
+
+        if self.patches_resolution == split_size:
+            last_stage = True
+        if last_stage:
+            self.branch_num = 1
+        else:
+            self.branch_num = 2
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(drop)
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=dim, act_layer=act_layer,
+                       drop=drop)
+        self.norm2 = norm_layer(dim)
+        self.selector = TokenChannelSelector(embed_dim=dim, keep_ratio=0.7)
+
+    def forward(self, x):
+        """
+        x: B, H*W, C
+        """
+
+        H = W = self.patches_resolution
+        B, L, C = x.shape
+        assert L == H * W, "flatten img_tokens has wrong size"
+        img = self.norm1(x)
+
+        attened_x = self.selector(img)
+        attened_x = self.proj(attened_x)
+        x = x + self.drop_path(attened_x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+
+
 class CSWinTransformer(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
@@ -334,7 +524,6 @@ class CSWinTransformer(nn.Module):
         heads = num_heads
 
         #encoder
-
         self.stage1_conv_embed = nn.Sequential(
             nn.Conv2d(in_chans, embed_dim, 7, 4, 2),
             Rearrange('b c h w -> b (h w) c', h=img_size // 4, w=img_size // 4),
@@ -388,8 +577,6 @@ class CSWinTransformer(nn.Module):
         self.norm = norm_layer(curr_dim)
 
         # decoder
-
-
         self.stage_up4 = nn.ModuleList(
             [CSWinBlock(
                 dim=curr_dim, num_heads=heads[3], reso=img_size // 32, mlp_ratio=mlp_ratio,
@@ -397,7 +584,6 @@ class CSWinTransformer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[np.sum(depth[:-1]) + i], norm_layer=norm_layer, last_stage=True)
                 for i in range(depth[-1])])
-
         self.upsample4 = CARAFE(curr_dim, curr_dim // 2)
         curr_dim = curr_dim // 2
 
@@ -410,34 +596,46 @@ class CSWinTransformer(nn.Module):
                 drop_path=dpr[np.sum(depth[:2]) + i], norm_layer=norm_layer)
                 for i in range(depth[2])]
         )
-
         self.upsample3 = CARAFE(curr_dim, curr_dim // 2)
         curr_dim = curr_dim // 2
 
         self.concat_linear3 = nn.Linear(256, 128)
         self.stage_up2 = nn.ModuleList(
-            [CSWinBlock(
+            [CSWinBlockWithSelector(
                 dim=curr_dim, num_heads=heads[1], reso=img_size // 8, mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias, qk_scale=qk_scale, split_size=split_size[1],
                 drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[np.sum(depth[:1]) + i], norm_layer=norm_layer)
                 for i in range(depth[1])])
+        # self.token_selector2 = TokenChannelSelector(embed_dim=curr_dim, keep_ratio=0.7)
         self.upsample2 = CARAFE(curr_dim, curr_dim // 2)
         curr_dim = curr_dim // 2
 
         self.concat_linear2 = nn.Linear(128, 64)
         self.stage_up1 = nn.ModuleList([
-            CSWinBlock(
+            CSWinBlockWithSelector(
                 dim=curr_dim, num_heads=heads[0], reso=img_size // 4, mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias, qk_scale=qk_scale, split_size=split_size[0],
                 drop=drop_rate, attn_drop=attn_drop_rate,
                 drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth[0])])
-
+        # self.token_selector1 = TokenChannelSelector(embed_dim=curr_dim, keep_ratio=0.7)
         self.upsample1 = CARAFE4(curr_dim, 64)
         self.norm_up = norm_layer(embed_dim)
         self.output = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
-        # Classifier head
+
+        # Frequency Decoder
+        self.wt = DWTForward(J=1, mode='zero', wave='haar')
+        self.wtEnhance = EnhancedFreqAwareBlock(in_channels=embed_dim*8)
+
+        self.dec4 = MultiScaleFeatureFusion(channels=embed_dim*8)
+        self.Up4 = up_conv(embed_dim*8, embed_dim*4)
+        self.dec3 = MultiScaleFeatureFusion(channels=embed_dim*4)
+        self.Up3 = up_conv(embed_dim*4, embed_dim*2)
+        self.dec2 = MultiScaleFeatureFusion(channels=embed_dim*2)
+        self.Up2 = up_conv(embed_dim*2, embed_dim)
+        self.dec1 = MultiScaleFeatureFusion(channels=embed_dim)
+        self.final_output = nn.Conv2d(embed_dim, self.num_classes, kernel_size=1, stride=1, padding=0)
 
         self.apply(self._init_weights)
 
@@ -505,6 +703,7 @@ class CSWinTransformer(nn.Module):
                 x = checkpoint.checkpoint(blk, x)
             else:
                 x = blk(x)
+        self.y4 = x
         x = self.upsample4(x)
         x = torch.cat([self.x3, x],-1)
         x = self.concat_linear4(x)
@@ -513,6 +712,7 @@ class CSWinTransformer(nn.Module):
                 x = checkpoint.checkpoint(blk, x)
             else:
                 x = blk(x)
+        self.y3 = x
         # print("decoder stage3", x.shape)
         x = self.upsample3(x)
         x = torch.cat([self.x2, x],-1)
@@ -521,7 +721,8 @@ class CSWinTransformer(nn.Module):
             if self.use_chk:
                 x = checkpoint.checkpoint(blk, x)
             else:
-                    x = blk(x)
+                x = blk(x)
+        self.y2 = x
         x = self.upsample2(x)
         x = torch.cat([self.x1, x],-1)
         x = self.concat_linear2(x)
@@ -530,6 +731,7 @@ class CSWinTransformer(nn.Module):
                 x = checkpoint.checkpoint(blk, x)
             else:
                 x = blk(x)
+        self.y1 = x
         x = self.norm_up(x)  # B L C
         return x
 
@@ -544,16 +746,54 @@ class CSWinTransformer(nn.Module):
         return x
 
     def forward(self, x):
-        x = self.forward_features(x)
+        x_tokens = self.forward_features(x)  
 
-        x = self.forward_up_features(x)
+        B, L, C = x_tokens.shape
+        H = W = int(L ** 0.5)           # L = (H')*(W')
+        x_map = x_tokens.permute(0, 2, 1).contiguous().view(B, C, H, W)
 
-        x = self.up_x4(x)
+        f_l, f_h = self.wt(x_map)  
 
+        f_h = torch.cat((f_h[0][:, :, 0, :, :], f_h[0][:, :, 1, :, :], f_h[0][:, :, 2, :, :]), dim=1)
 
-        return x
+        f4 = self.wtEnhance(f_l, f_h)
+        # print(f"=========f4 shape: {f4.shape}")
+        f4 = F.interpolate(f4, size=(H, W), mode='bilinear')
+        # print(f"==========f4 shape:{f4.shape}")
 
+        x = self.forward_up_features(x_tokens)
+        # print(f"===========x before up_x4: {x.shape}==========")
+        # Frequency Decoder
+        B, L, C = self.y4.shape
+        H = W = int(L ** 0.5)           # L = (H')*(W')
+        self.y4 = self.y4.permute(0, 2, 1).contiguous().view(B, C, H, W)
+        f4 = self.dec4(f4, self.y4)
+        f3 = self.Up4(f4)
+        # print(f"==========f3 shape:{f3.shape}")
 
+        B, L, C = self.y3.shape
+        H = W = int(L ** 0.5)           # L = (H')*(W')
+        self.y3 = self.y3.permute(0, 2, 1).contiguous().view(B, C, H, W)
+        f3 = self.dec3(f3, self.y3)
+        f2 = self.Up3(f3)
+        # print(f"==========f2 shape:{f2.shape}")
 
+        B, L, C = self.y2.shape
+        H = W = int(L ** 0.5)           # L = (H')*(W')
+        self.y2 = self.y2.permute(0, 2, 1).contiguous().view(B, C, H, W)
+        f2 = self.dec2(f2, self.y2)
+        f1 = self.Up2(f2)
+        # print(f"==========f1 shape:{f1.shape}")
 
+        B, L, C = self.y1.shape
+        H = W = int(L ** 0.5)           # L = (H')*(W')
+        self.y1 = self.y1.permute(0, 2, 1).contiguous().view(B, C, H, W)
+        f1 = self.dec1(f1, self.y1)
 
+        # f1 = self.final_output(f1)
+        # print(f"==========out shape:{f1.shape}")
+        f1 = self.up_x4(f1.view(B, C, H*W).permute(0, 2, 1))
+
+        # x = self.up_x4(x)
+        # print(f"===========x after up_x4: {x.shape}==========")
+        return f1

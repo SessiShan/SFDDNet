@@ -8,8 +8,7 @@ import logging
 
 import torch
 import torch.nn as nn
-from .cswin_unet import CSWinTransformer
-
+from .sfddnet import CSWinTransformer
 
 
 logger = logging.getLogger(__name__)
