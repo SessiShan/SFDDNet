@@ -10,7 +10,7 @@ Automatic segmentation of breast ultrasound (BUS) images is a critical yet chall
 
 -   **Spatial-Frequency Dual Decoder Network (SFDDNet):** A novel architecture with two parallel decoders to process spatial and frequency information simultaneously, generating robust, multi-domain feature representations.
 -   **Enhanced Frequency-Aware Block (EFAB):** Utilizes wavelet decomposition to decouple and differentially process low-frequency global context and high-frequency boundary details, significantly improving the model's robustness to noise and artifacts.
--   **Dual-Selective Transformer (DST):** An efficient module integrated into the decoder that enhances computational efficiency and performance by adaptively pruning redundant tokens and channels.
+-   **Dual-Selective Transformer (DST):** A module integrated into the decoder that enhances the performance by adaptively pruning redundant tokens and channels.
 -   **Spatial-Frequency Fusion Block (SFFB):** A multi-scale fusion mechanism that adaptively integrates the outputs of the dual decoders, ensuring effective synergy between spatial and frequency features.
 
 
